@@ -3,32 +3,35 @@ import random
 
 import gym
 import d4rl
-import neorl
 
 import numpy as np
 import torch
 
 
 from models.nets import MLP
-from models.actor_critic import ActorProb, Critic
+from models.actor_critic import MAPLEActor, MAPLECritic
 from models.dist import TanhDiagGaussian
 from models.dynamics_model import EnsembleDynamicsModel
+from models.rnn import GRU_Model
 from dynamics import EnsembleDynamics
 from utils.scaler import StandardScaler
 from utils.termination_fns import get_termination_fn
 from utils.load_dataset import qlearning_dataset, load_neorl_dataset, normalize_rewards
-from utils.buffer import ReplayBuffer
+from utils.buffer import ReplayTrajBuffer
 from utils.logger import Logger, make_log_dirs
 from utils.policy_trainer import PolicyTrainer
-from policies import MOBILEPolicy
+from policies import MAPLEPolicy
 from configs import loaded_args
 
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--algo-name", type=str, default="mobile")
+    parser.add_argument("--algo-name", type=str, default="maple")
     parser.add_argument("--task", type=str, default="walker2d-medium-expert-v2")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--context-hidden-dims", nargs="*", default=(16,))
+    parser.add_argument("--recurrent-hidden-units", type=int, default=128)
+    parser.add_argument("--penalty-type", type=str, default="lcb")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     known_args, _ = parser.parse_known_args()
@@ -40,21 +43,26 @@ def get_args():
 
 
 def train(args=get_args()):
+    print(args)
     # create env and dataset
     assert args.domain in ["gym", "adroit", "neorl"]
     if args.domain == "neorl":
-        task, version, data_type = tuple(args.task.split("-"))
-        env = neorl.make(task+'-'+version)
-        dataset = load_neorl_dataset(env, data_type)
+        # task, version, data_type = tuple(args.task.split("-"))
+        # env = neorl.make(task+'-'+version)
+        # dataset = load_neorl_dataset(env, data_type)
+        raise ValueError("NeoRL not supported yet")
     else:
         env = gym.make(args.task)
         dataset = qlearning_dataset(env)
+    rewards = dataset["rewards"]
+    data_size = len(rewards)
     if args.norm_reward:
         # dataset = normalize_rewards(dataset)
         r_mean, r_std = dataset["rewards"].mean(), dataset["rewards"].std()
         dataset["rewards"] = (dataset["rewards"] - r_mean) / (r_std + 1e-3)
 
     args.obs_shape = env.observation_space.shape
+    args.obs_dim = np.prod(args.obs_shape)
     args.action_dim = np.prod(env.action_space.shape)
     args.max_action = env.action_space.high[0]
 
@@ -67,21 +75,55 @@ def train(args=get_args()):
     env.seed(args.seed)
 
     # create policy model
-    actor_backbone = MLP(input_dim=np.prod(args.obs_shape), hidden_dims=args.hidden_dims)
+    device = args.device
+    actor_context_extractor = GRU_Model(
+        args.obs_dim,
+        args.action_dim,
+        args.recurrent_hidden_units,
+        device=device,
+    ).to(device)
+    actor_backbone = MLP(
+        input_dim=args.obs_dim + args.context_hidden_dims[-1],
+        hidden_dims=args.hidden_dims,
+    )
+    preprocess_net = MLP(
+        args.recurrent_hidden_units,
+        hidden_dims=args.context_hidden_dims,
+    )
     dist = TanhDiagGaussian(
         latent_dim=getattr(actor_backbone, "output_dim"),
         output_dim=args.action_dim,
         unbounded=True,
         conditioned_sigma=True
     )
-    actor = ActorProb(actor_backbone, dist, args.device)
-    actor_optim = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+    actor = MAPLEActor(actor_backbone, preprocess_net, dist, device).to(device)
+    actor_optim = torch.optim.Adam(
+        [*actor_context_extractor.parameters(), *actor.parameters()],
+        lr=args.actor_lr
+    )
+    critic_context_extractor = GRU_Model(
+        args.obs_dim,
+        args.action_dim,
+        args.recurrent_hidden_units,
+        device=device,
+    ).to(device)
     critics = []
     for i in range(args.num_q_ensemble):
-        critic_backbone = MLP(input_dim=np.prod(args.obs_shape) + args.action_dim, hidden_dims=args.hidden_dims)
-        critics.append(Critic(critic_backbone, args.device))
-    critics = torch.nn.ModuleList(critics)
-    critics_optim = torch.optim.Adam(critics.parameters(), lr=args.critic_lr)
+        ### Concatenate before feed into nets
+        preprocess_net = MLP(
+            args.recurrent_hidden_units,
+            hidden_dims=args.context_hidden_dims,
+        )
+        critic_backbone = MLP(
+            input_dim=args.obs_dim + args.context_hidden_dims[-1] + args.action_dim,
+            hidden_dims=args.hidden_dims
+        )
+        critics.append(MAPLECritic(critic_backbone, preprocess_net, device))
+    critics = torch.nn.ModuleList(critics).to(device)
+    critics_optim = torch.optim.Adam(
+        [*critic_context_extractor.parameters(), *critics.parameters()],
+        lr=args.critic_lr
+    )
 
     if args.lr_scheduler:
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(actor_optim, args.epoch)
@@ -94,7 +136,7 @@ def train(args=get_args()):
 
         args.target_entropy = target_entropy
 
-        log_alpha = torch.zeros(1, requires_grad=True, device=args.device)
+        log_alpha = torch.zeros(1, requires_grad=True, device=device)
         alpha_optim = torch.optim.Adam([log_alpha], lr=args.alpha_lr)
         alpha = (target_entropy, log_alpha, alpha_optim)
     else:
@@ -103,13 +145,13 @@ def train(args=get_args()):
     # create dynamics
     load_dynamics_model = True if args.load_dynamics_path else False
     dynamics_model = EnsembleDynamicsModel(
-        obs_dim=np.prod(args.obs_shape),
+        obs_dim=args.obs_dim,
         action_dim=args.action_dim,
         hidden_dims=args.dynamics_hidden_dims,
         num_ensemble=args.n_ensemble,
         num_elites=args.n_elites,
         weight_decays=args.dynamics_weight_decay,
-        device=args.device
+        device=device
     )
     dynamics_optim = torch.optim.Adam(
         dynamics_model.parameters(),
@@ -128,9 +170,11 @@ def train(args=get_args()):
         dynamics.load(args.load_dynamics_path)
 
     # create policy
-    policy = MOBILEPolicy(
+    policy = MAPLEPolicy(
         dynamics,
+        actor_context_extractor,
         actor,
+        critic_context_extractor,
         critics,
         actor_optim,
         critics_optim,
@@ -138,29 +182,38 @@ def train(args=get_args()):
         gamma=args.gamma,
         alpha=alpha,
         penalty_coef=args.penalty_coef,
+        penalty_type=args.penalty_type,
         num_samples=args.num_samples,
         deterministic_backup=args.deterministic_backup,
         max_q_backup=args.max_q_backup
     )
 
     # create buffer
-    real_buffer = ReplayBuffer(
-        buffer_size=len(dataset["observations"]),
+    real_buffer = ReplayTrajBuffer(
+        buffer_size=data_size,
         obs_shape=args.obs_shape,
         obs_dtype=np.float32,
         action_dim=args.action_dim,
         action_dtype=np.float32,
-        device=args.device
+        max_context_horizon=args.rollout_length,
+        context_dim=args.recurrent_hidden_units,
+        device=device
     )
-    real_buffer.load_dataset(dataset)
+    real_buffer.load_dataset(
+        dataset,
+        actor_context_extractor,
+        critic_context_extractor
+    )
 
-    fake_buffer = ReplayBuffer(
+    fake_buffer = ReplayTrajBuffer(
         buffer_size=args.rollout_batch_size*args.rollout_length*args.model_retain_epochs,
         obs_shape=args.obs_shape,
         obs_dtype=np.float32,
         action_dim=args.action_dim,
         action_dtype=np.float32,
-        device=args.device
+        max_context_horizon=args.rollout_length,
+        context_dim=args.recurrent_hidden_units,
+        device=device
     )
 
     # log
@@ -197,7 +250,7 @@ def train(args=get_args()):
     # train
     if not load_dynamics_model:
         dynamics.train(
-            real_buffer.sample_all(),
+            dataset,
             logger,
             max_epochs_since_update=args.max_epochs_since_update,
             max_epochs=args.dynamics_max_epochs

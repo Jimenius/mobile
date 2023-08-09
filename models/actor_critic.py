@@ -47,3 +47,55 @@ class Critic(nn.Module):
         logits = self.backbone(obs)
         values = self.last(logits)
         return values
+
+
+class MAPLEActor(ActorProb):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        preprocess_net: nn.Module,
+        dist_net: nn.Module,
+        device: str = "cpu"
+    ) -> None:
+        super().__init__(backbone, dist_net, device)
+        self.context_preprocess_net = preprocess_net
+
+    def forward(
+        self,
+        obs: Union[np.ndarray, torch.Tensor],
+        context: Union[np.ndarray, torch.Tensor],
+    ) -> torch.distributions.Distribution:
+        obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        context = torch.as_tensor(context, device=self.device, dtype=torch.float32)
+        context = self.context_preprocess_net(context)
+        obs = torch.cat((obs, context), dim=-1)
+        logits = self.backbone(obs)
+        logits = logits.squeeze(1)
+        dist = self.dist_net(logits)
+        return dist
+    
+
+class MAPLECritic(Critic):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        preprocess_net: nn.Module,
+        device: str = "cpu"
+    ) -> None:
+        super().__init__(backbone, device)
+        self.context_preprocess_net = preprocess_net
+
+    def forward(
+        self,
+        obs: Union[np.ndarray, torch.Tensor],
+        context: Union[np.ndarray, torch.Tensor],
+        actions: Union[np.ndarray, torch.Tensor],
+    ) -> torch.Tensor:
+        obs = torch.as_tensor(obs, device=self.device, dtype=torch.float32)
+        context = torch.as_tensor(context, device=self.device, dtype=torch.float32)
+        context = self.context_preprocess_net(context)
+        actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        obs = torch.cat([obs, context, actions], dim=-1)
+        logits = self.backbone(obs)
+        values = self.last(logits)
+        return values

@@ -23,6 +23,7 @@ class PolicyTrainer:
         fake_buffer: ReplayBuffer,
         logger: Logger,
         rollout_setting: Tuple[int, int, int],
+        context_update_freq: int = 1,
         epoch: int = 1000,
         step_per_epoch: int = 1000,
         batch_size: int = 256,
@@ -38,6 +39,7 @@ class PolicyTrainer:
 
         self._rollout_freq, self._rollout_batch_size, \
             self._rollout_length = rollout_setting
+        self._context_update_freq = context_update_freq
 
         self._epoch = epoch
         self._step_per_epoch = step_per_epoch
@@ -59,12 +61,12 @@ class PolicyTrainer:
             pbar = tqdm(range(self._step_per_epoch), desc=f"Epoch #{e}/{self._epoch}")
             for it in pbar:
                 if num_timesteps % self._rollout_freq == 0:
-                    init_obss = self.real_buffer.sample(self._rollout_batch_size)["observations"].cpu().numpy()
-                    rollout_transitions, rollout_info = self.policy.rollout(init_obss, self._rollout_length)
-                    self.fake_buffer.add_batch(**rollout_transitions)
+                    batch = self.real_buffer.sample_rollout(self._rollout_batch_size)
+                    rollout_batch, rollout_info = self.policy.rollout(batch, self._rollout_length)
+                    self.fake_buffer.add_batch(rollout_batch)
                     self.logger.log(
-                        "num rollout transitions: {}, reward mean: {:.4f}".\
-                            format(rollout_info["num_transitions"], rollout_info["reward_mean"])
+                        "reward mean: {:.4f}".\
+                            format(rollout_info["reward_mean"])
                     )
                     for _key, _value in rollout_info.items():
                         self.logger.logkv_mean("rollout_info/"+_key, _value)
@@ -108,6 +110,9 @@ class PolicyTrainer:
                 # save checkpoint
                 torch.save(self.policy.state_dict(), os.path.join(self.logger.checkpoint_dir, "policy.pth"))
 
+            if e % self._context_update_freq == 0:
+                self.policy.update_context()
+
         self.logger.log("total time: {:.2f}s".format(time.time() - start_time))
         torch.save(self.policy.state_dict(), os.path.join(self.logger.model_dir, "policy.pth"))
         self.policy.dynamics.save(self.logger.model_dir)
@@ -118,17 +123,20 @@ class PolicyTrainer:
     def _evaluate(self) -> Dict[str, List[float]]:
         self.policy.eval()
         obs = self.eval_env.reset()
+        last_action = None
+        context = None
         eval_ep_info_buffer = []
         num_episodes = 0
         episode_reward, episode_length = 0, 0
 
         while num_episodes < self._eval_episodes:
-            action = self.policy.select_action(obs, deterministic=True)
+            action, context = self.policy.select_action(obs, last_action, context, deterministic=True)
             next_obs, reward, terminal, _ = self.eval_env.step(action.flatten())
             episode_reward += reward
             episode_length += 1
 
             obs = next_obs
+            last_action = action
 
             if terminal:
                 eval_ep_info_buffer.append(

@@ -115,13 +115,15 @@ class EnsembleDynamics(BaseDynamics):
 
         samples = torch.stack([mean + torch.randn_like(std) * std for i in range(num_samples)], 0)
         next_obss = samples[..., :-1]
-        return next_obss
+        return next_obss, mean, std
 
     def format_samples_for_training(self, data: Dict) -> Tuple[np.ndarray, np.ndarray]:
         obss = data["observations"]
         actions = data["actions"]
         next_obss = data["next_observations"]
         rewards = data["rewards"]
+        if len(rewards.shape) == 1:
+            rewards = rewards[:, None]
         delta_obss = next_obss - obss
         inputs = np.concatenate((obss, actions), axis=-1)
         targets = np.concatenate((delta_obss, rewards), axis=-1)
@@ -135,11 +137,12 @@ class EnsembleDynamics(BaseDynamics):
         max_epochs_since_update: int = 5,
         batch_size: int = 256,
         holdout_ratio: float = 0.2,
-        logvar_loss_coef: float = 0.01
+        logvar_loss_coef: float = 0.01,
+        min_holdout_size: int = 1000,
     ) -> None:
         inputs, targets = self.format_samples_for_training(data)
         data_size = inputs.shape[0]
-        holdout_size = min(int(data_size * holdout_ratio), 1000)
+        holdout_size = min(int(data_size * holdout_ratio), min_holdout_size)
         train_size = data_size - holdout_size
         train_splits, holdout_splits = torch.utils.data.random_split(range(data_size), (train_size, holdout_size))
         train_inputs, train_targets = inputs[train_splits.indices], targets[train_splits.indices]
