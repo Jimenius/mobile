@@ -141,15 +141,25 @@ class ReplayTrajBuffer(ReplayBuffer):
         mini_target_ind = 0
         ### Record the number of mini trajectories
         mini_traj_cum_num = 0
+        ### trajectory length
+        l = 0
         self.index_mapping = [None] * data_size
+        self.trajectory_lengths = []
+        self.max_trajectory_length = 0
         for i in range(data_size):
             self.index_mapping[i] = (traj_target_ind, mini_target_ind)
             mini_target_ind += 1
-            if mask[i] or mini_target_ind == self.max_context_horizon:
+            l += 1
+            if i < data_size - 1 and mask[i + 1] or i == data_size - 1 or mini_target_ind == self.max_context_horizon:
                 ### A new slot
                 traj_target_ind = (traj_target_ind + 1) % self._max_size
                 mini_traj_cum_num += 1
                 mini_target_ind = 0
+            if i < data_size - 1 and mask[i + 1] or i == data_size - 1:
+                self.trajectory_lengths.append(l)
+                if l > self.max_trajectory_length:
+                    self.max_trajectory_length = l
+                l = 0
 
         return mini_traj_cum_num
 
@@ -163,6 +173,7 @@ class ReplayTrajBuffer(ReplayBuffer):
                 index = self.index_mapping[i]
                 target[index] = data_dict[k][i]
     
+    @torch.no_grad()
     def _get_context_update(
         self,
         actor_context_extractor: nn.Module,
@@ -172,6 +183,9 @@ class ReplayTrajBuffer(ReplayBuffer):
         """Get new context with updated extractors"""
         total_traj_num = len(self.trajectory_lengths)
         last_traj_start_index = 0
+        data_size = len(self.observations_flat)
+        actor_context = np.zeros((data_size, self.context_dim))
+        critic_context = np.zeros((data_size, self.context_dim))
         for i_ter in range(int(np.ceil(total_traj_num / traj_num_to_infer))):
             traj_lens_it = self.trajectory_lengths[traj_num_to_infer * i_ter : min(traj_num_to_infer * (i_ter + 1), total_traj_num)]
             num_traj = len(traj_lens_it)
@@ -198,9 +212,6 @@ class ReplayTrajBuffer(ReplayBuffer):
                 (np.zeros((num_traj, 1, self.context_dim)), critic_context_out[:, :-1].cpu().detach().numpy()),
                 axis=1
             )
-            data_size = len(self.observations_flat)
-            actor_context = np.zeros((data_size, self.context_dim))
-            critic_context = np.zeros((data_size, self.context_dim))
             start_index = last_traj_start_index
             for ind, item in enumerate(traj_lens_it):
                 ### The context in the buffer is of shape (data_size, context_dim)
@@ -225,10 +236,11 @@ class ReplayTrajBuffer(ReplayBuffer):
         data_size = len(rewards)
         obs_mask = np.abs(observations[1:] - next_observations[:-1]) < 1e-5
         mask = np.all(obs_mask, axis=-1)
+        mask = mask | terminals[1:]
         mask = np.concatenate(
             (np.zeros(1, dtype=bool), ~mask)
         )
-        mask = mask | terminals
+        ### mask == 1 indicates a new episode, last_action and context should be 0
         last_actions = np.concatenate(
             (np.zeros((1, self.action_dim), dtype=self.action_dtype),
             actions[:-1, :]), axis=0,
@@ -239,21 +251,11 @@ class ReplayTrajBuffer(ReplayBuffer):
         self.observations_flat = observations.copy()
         self.last_actions_flat = last_actions.copy()
         
-        ### Get lengths of trajectories
-        l = 0
-        self.trajectory_lengths = []
-        self.max_trajectory_length = 0
-        for i in range(data_size):
-            l += 1
-            if mask[i]:
-                self.trajectory_lengths.append(l)
-                if l > self.max_trajectory_length:
-                    self.max_trajectory_length = l
-                l = 0
+        ### Get lengths of trajectories and index mapping
+        mini_traj_cum_num = self._set_index_mapping(data_size, mask)
 
         self.actor_context_flat, self.critic_context_flat = self._get_context_update(actor_context_extractor, critic_context_extractor,)
 
-        mini_traj_cum_num = self._set_index_mapping(data_size, mask)
         data_dict = {
             "observations": observations,
             "next_observations": next_observations,
@@ -261,7 +263,7 @@ class ReplayTrajBuffer(ReplayBuffer):
             "last_actions": last_actions,
             "rewards": rewards,
             "terminals": terminals,
-            "valid": ~mask,
+            "valid": np.ones(data_size, dtype=np.float32),
             "actor_context": self.actor_context_flat,
             "critic_context": self.critic_context_flat,
         }

@@ -70,7 +70,6 @@ class MAPLEActor(ActorProb):
         context = self.context_preprocess_net(context)
         obs = torch.cat((obs, context), dim=-1)
         logits = self.backbone(obs)
-        logits = logits.squeeze(1)
         dist = self.dist_net(logits)
         return dist
     

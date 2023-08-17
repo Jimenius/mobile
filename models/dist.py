@@ -84,7 +84,9 @@ class TanhDiagGaussian(DiagGaussian):
         conditioned_sigma=False,
         max_mu=1.0,
         sigma_min=-5.0,
-        sigma_max=2.0
+        sigma_max=2.0,
+        unbounded_mu_min=-9.0,
+        unbounded_mu_max=9.0,
     ):
         super().__init__(
             latent_dim=latent_dim,
@@ -95,9 +97,13 @@ class TanhDiagGaussian(DiagGaussian):
             sigma_min=sigma_min,
             sigma_max=sigma_max
         )
+        self._unbounded_mu_min = unbounded_mu_min
+        self._unbounded_mu_max = unbounded_mu_max
 
     def forward(self, logits):
         mu = self.mu(logits)
+        ### clamp in MAPLE
+        mu = torch.clamp(mu, self._unbounded_mu_min, self._unbounded_mu_max)
         if not self._unbounded:
             mu = self._max * torch.tanh(mu)
         if self._c_sigma:

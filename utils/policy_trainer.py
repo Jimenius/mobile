@@ -28,6 +28,7 @@ class PolicyTrainer:
         step_per_epoch: int = 1000,
         batch_size: int = 256,
         real_ratio: float = 0.05,
+        eval_freq: int = 1,
         eval_episodes: int = 10,
         lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
     ) -> None:
@@ -45,6 +46,7 @@ class PolicyTrainer:
         self._step_per_epoch = step_per_epoch
         self._batch_size = batch_size
         self._real_ratio = real_ratio
+        self._eval_freq = eval_freq
         self._eval_episodes = eval_episodes
         self.lr_scheduler = lr_scheduler
 
@@ -87,7 +89,7 @@ class PolicyTrainer:
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
             
-            if e % 10 == 0:
+            if e % self._eval_freq == 0:
                 # evaluate current policy
                 eval_info = self._evaluate()
                 ep_reward_mean, ep_reward_std = np.mean(eval_info["eval/episode_reward"]), np.std(eval_info["eval/episode_reward"])
@@ -111,7 +113,7 @@ class PolicyTrainer:
                 torch.save(self.policy.state_dict(), os.path.join(self.logger.checkpoint_dir, "policy.pth"))
 
             if e % self._context_update_freq == 0:
-                self.policy.update_context()
+                self.policy.update_context(self.real_buffer)
 
         self.logger.log("total time: {:.2f}s".format(time.time() - start_time))
         torch.save(self.policy.state_dict(), os.path.join(self.logger.model_dir, "policy.pth"))
@@ -145,6 +147,8 @@ class PolicyTrainer:
                 num_episodes +=1
                 episode_reward, episode_length = 0, 0
                 obs = self.eval_env.reset()
+                last_action = None
+                context = None
         
         return {
             "eval/episode_reward": [ep_info["episode_reward"] for ep_info in eval_ep_info_buffer],

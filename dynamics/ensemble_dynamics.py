@@ -115,7 +115,7 @@ class EnsembleDynamics(BaseDynamics):
 
         samples = torch.stack([mean + torch.randn_like(std) * std for i in range(num_samples)], 0)
         next_obss = samples[..., :-1]
-        return next_obss, mean, std
+        return next_obss
 
     def format_samples_for_training(self, data: Dict) -> Tuple[np.ndarray, np.ndarray]:
         obss = data["observations"]

@@ -31,7 +31,8 @@ def get_args():
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--context-hidden-dims", nargs="*", default=(16,))
     parser.add_argument("--recurrent-hidden-units", type=int, default=128)
-    parser.add_argument("--penalty-type", type=str, default="lcb")
+    parser.add_argument("--context-update-freq", type=int, default=1)
+    parser.add_argument("--uncertainty-mode", type=str, default="aleatoric")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     known_args, _ = parser.parse_known_args()
@@ -159,17 +160,27 @@ def train(args=get_args()):
     )
     scaler = StandardScaler()
     termination_fn = get_termination_fn(task=args.task)
+    if args.uncertainty_mode in ("aleatoric", "pairwise-diff"):
+        model_penalty_coef = args.penalty_coef
+    else:
+        model_penalty_coef = 0.0
     dynamics = EnsembleDynamics(
         dynamics_model,
         dynamics_optim,
         scaler,
-        termination_fn
+        termination_fn,
+        penalty_coef=model_penalty_coef,
+        uncertainty_mode=args.uncertainty_mode,
     )
 
     if args.load_dynamics_path:
         dynamics.load(args.load_dynamics_path)
 
     # create policy
+    if args.uncertainty_mode == "lcb":
+        penalty_coef = args.penalty_coef
+    else:
+        penalty_coef = 0.0
     policy = MAPLEPolicy(
         dynamics,
         actor_context_extractor,
@@ -181,8 +192,7 @@ def train(args=get_args()):
         tau=args.tau,
         gamma=args.gamma,
         alpha=alpha,
-        penalty_coef=args.penalty_coef,
-        penalty_type=args.penalty_type,
+        penalty_coef=penalty_coef,
         num_samples=args.num_samples,
         deterministic_backup=args.deterministic_backup,
         max_q_backup=args.max_q_backup
@@ -206,7 +216,7 @@ def train(args=get_args()):
     )
 
     fake_buffer = ReplayTrajBuffer(
-        buffer_size=args.rollout_batch_size*args.rollout_length*args.model_retain_epochs,
+        buffer_size=args.rollout_batch_size*args.model_retain_epochs,
         obs_shape=args.obs_shape,
         obs_dtype=np.float32,
         action_dim=args.action_dim,
@@ -239,10 +249,12 @@ def train(args=get_args()):
         fake_buffer=fake_buffer,
         logger=logger,
         rollout_setting=(args.rollout_freq, args.rollout_batch_size, args.rollout_length),
+        context_update_freq=args.context_update_freq,
         epoch=args.epoch,
         step_per_epoch=args.step_per_epoch,
         batch_size=args.batch_size,
         real_ratio=args.real_ratio,
+        eval_freq=args.eval_freq,
         eval_episodes=args.eval_episodes,
         lr_scheduler=lr_scheduler
     )
