@@ -268,8 +268,10 @@ def train(args=get_args()):
             max_epochs=args.dynamics_max_epochs
         )
     
-    policy_trainer.train()
-
+    performance = policy_trainer.train()
+    performance_str = f"last 10 performance {performance['last_10_performace']}"
+    print(performance_str)
+    logger.log(performance_str)
 
 if __name__ == "__main__":
     train()

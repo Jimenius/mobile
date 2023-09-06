@@ -104,6 +104,7 @@ class PolicyTrainer:
                     last_10_performance.append(ep_reward_mean)
                     self.logger.logkv("eval/episode_reward", ep_reward_mean)
                     self.logger.logkv("eval/episode_reward_std", ep_reward_std)
+                self.logger.logkv("eval/last_10_performance", np.mean(last_10_performance))
                 self.logger.logkv("eval/episode_length", ep_length_mean)
                 self.logger.logkv("eval/episode_length_std", ep_length_std)
                 self.logger.set_timestep(num_timesteps)
