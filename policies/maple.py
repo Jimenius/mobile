@@ -331,6 +331,9 @@ class MAPLEPolicy(BasePolicy):
             "loss/actor": actor_loss.item(),
             "loss/critic": critic_loss.item()
         }
+        if isinstance(penalty, torch.Tensor):
+            result["debug/LCBpenalty_mean"] = penalty.mean().item()
+            result["debug/LCBpenalty_std"] = penalty.std().item()
 
         if self._is_auto_alpha:
             result["loss/alpha"] = alpha_loss.item()
